@@ -31,7 +31,7 @@
 # mount) are staged into a Linux directory first: mmdebstrap cannot build a
 # rootfs on drvfs/9p (ownership, device nodes, mounts), and a Windows checkout
 # of the submodule carries CRLF in its extension-less scripts (rpi-image-gen,
-# bin/ns, bin/ig). The staged copy is refreshed on every run.
+# bin/ns, bin/ig, depends). The staged copy is refreshed on every run.
 
 set -euo pipefail
 
@@ -51,7 +51,7 @@ WORK_VOLUME=${DRONEOS_WORK_VOLUME:-droneos-work}
 
 usage() {
     cat <<'USAGE'
-Usage: ./build.sh [options] [-- IGconf_key=value ...]
+Usage: ./build.sh [options] [IGconf_key=value ...]
 
 Builds the DroneOS image described by droneos.yaml with rpi-image-gen.
 
@@ -66,7 +66,8 @@ Options:
       --engine <name>    Container engine for --docker: docker (default), podman
       --rebuild          --docker: rebuild the builder image from scratch
       --shell            --docker: open a shell in the builder container
-      --deps             Install / upgrade the host dependencies (sudo) and exit
+      --deps             Install / upgrade the host dependencies (sudo) and
+                         exit; with --docker: refresh the builder image and exit
   -f, --fs-only          Build the filesystem only, skip image generation
   -i, --image-only       Skip the filesystem, only (re)generate the image
   -I, --interactive      Let rpi-image-gen ask before each stage
@@ -77,8 +78,8 @@ Options:
       --dry-run          Print what would run and exit
   -h, --help             This help
 
-  key=value words (before or after --) are passed to rpi-image-gen as variable
-  overrides, e.g.   ./build.sh -- IGconf_device_user1pass='Fo0bar!!'
+  key=value words (anywhere, or after --) are passed to rpi-image-gen as
+  variable overrides, e.g.   ./build.sh IGconf_device_user1pass='Fo0bar!!'
 
 Notes:
   * apt inside the chroot runs as its own user and needs world-execute on every
@@ -143,10 +144,13 @@ CONFIG=${CONFIG:-$ROOT/droneos.yaml}
 CONFIG=$(realpath -e "$CONFIG")
 OUTDIR=${OUTDIR:-$ROOT/out}
 
-# Version tag for rpi-image-gen's deploy directory (deploy-<version>). Computed
+# Version tag for rpi-image-gen's chroot-/deploy-<version> directories. Computed
 # on the host and handed down by build.ps1 / --docker, because inside the
-# container the bind-mounted index always looks dirty.
-VERSION=${DRONEOS_VERSION:-$(git -c safe.directory='*' -C "$ROOT" describe --tags --always --dirty 2>/dev/null || date +%Y-%m-%d)}
+# container the bind-mounted index always looks dirty. Restricted to characters
+# that are safe in a path component (a tag like release/1.0 must not nest dirs).
+VERSION=${DRONEOS_VERSION:-$(git -c safe.directory='*' -C "$ROOT" describe --tags --always --dirty 2>/dev/null || true)}
+VERSION=${VERSION:-$(date +%Y-%m-%d)}
+VERSION=${VERSION//[^A-Za-z0-9._-]/_}
 
 # ---- Helpers ----------------------------------------------------------------
 ensure_submodule() {
@@ -161,47 +165,59 @@ ensure_submodule() {
     [[ -f "$ROOT/rpi-image-gen/rpi-image-gen" ]] || die "Submodule checkout failed"
 }
 
-# Filesystem type of a path (stat -f). Linux-native types can host the build
-# directly; anything else (v9fs = WSL /mnt/c, fuse/virtiofs = Docker Desktop
-# bind mounts, cifs, ntfs, ...) needs staging.
+# Filesystem type of a path (stat -f). Windows/network/FUSE mounts cannot host
+# the build (no ownership, device nodes or bind mounts) and need staging.
 fs_type() { stat -f -c %T "$1" 2>/dev/null || echo unknown; }
-fs_is_linux_native() {
+fs_is_foreign() {
     case $(fs_type "$1") in
-        ext2/ext3|ext4|btrfs|xfs|zfs|f2fs|tmpfs|overlayfs|reiserfs|jfs|nilfs) return 0 ;;
+        v9fs|9p|drvfs|fuse*|virtiofs|cifs|smb*|nfs*|vboxsf|prl_fs|ntfs*|vfat|msdos|exfat|fat|hfs*|afs|sshfs|autofs) return 0 ;;
         *) return 1 ;;
     esac
 }
 
+# May this file have its CRLF rewritten? Callers only pass files that grep -I
+# already considers text (no NUL bytes); file(1) then vetoes the binary
+# families that can be NUL-free, so keyrings, images and archives stay intact
+# while unit files, INI-style configs and templates are treated as text.
 is_text_file() {
-    local f=$1 mime
-    if command -v file >/dev/null 2>&1; then
-        mime=$(file -b --mime-type "$f" 2>/dev/null || true)
-        case $mime in
-            text/*|application/json|application/x-shellscript|application/x-yaml|application/x-desktop|inode/x-empty) return 0 ;;
-            '') ;;   # file(1) failed - fall through to the heuristics
-            *) return 1 ;;
-        esac
-    fi
-    [[ $(head -c 2 "$f" 2>/dev/null) == '#!' ]] && return 0
-    case ${f##*/} in
-        *.sh|*.py|*.yaml|*.yml|*.json|*.cfg|*.in|*.adoc|*.md|*.txt|*.defs|*.mk|*.meta|*.conf|*.list|*.env|*.service|*.rules|*.html|*.css|*.js|*.svg|*.patch|*.dts|*.dtsi|Makefile|depends|LICENSE) return 0 ;;
+    local f=$1 mime=''
+    command -v file >/dev/null 2>&1 && mime=$(file -b --mime-type "$f" 2>/dev/null || true)
+    case $mime in
+        image/svg+xml) return 0 ;;   # XML, not pixels
+        image/*|audio/*|video/*|font/*) return 1 ;;
+        application/pgp*|application/x-bytecode*|application/zip|application/gzip|application/x-xz|\
+        application/x-bzip2|application/zstd|application/x-tar|application/x-7z-compressed|\
+        application/x-rar|application/x-executable|application/x-sharedlib|application/x-object|\
+        application/x-pie-executable|application/x-dosexec|application/x-mach-binary|\
+        application/vnd.*|application/pdf|application/x-sqlite3|application/wasm) return 1 ;;
     esac
-    return 1
+    return 0
 }
 
 # Copy the checkout to a Linux directory, drop CRLF from text files, make sure
 # the tool entry points are executable.
 stage_sources() {
     local dst=$1
-    command -v rsync >/dev/null 2>&1 || die "rsync is required to stage the sources"
     log "Staging sources: $ROOT -> $dst"
     mkdir -p "$dst"
-    rsync -a --delete --chmod=go-w \
-        --exclude '/.git' --exclude '/rpi-image-gen/.git' \
-        --exclude '/work' --exclude '/out' --exclude '__pycache__' \
-        "$ROOT/" "$dst/"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete --chmod=go-w \
+            --exclude '/.git' --exclude '/rpi-image-gen/.git' \
+            --exclude '/work' --exclude '/out' --exclude '__pycache__' \
+            "$ROOT/" "$dst/"
+    else
+        # rsync is one of the packages install_deps installs; until then copy.
+        info "rsync not available - copying with cp"
+        rm -rf -- "$dst"
+        mkdir -p "$dst"
+        (cd "$ROOT" && find . -mindepth 1 -maxdepth 1 \
+            ! -name .git ! -name work ! -name out -exec cp -a {} "$dst/" \;)
+        rm -rf -- "$dst/rpi-image-gen/.git"
+        find "$dst" -name __pycache__ -type d -prune -exec rm -rf {} +
+        chmod -R go-w "$dst"
+    fi
 
-    # grep -I skips binaries and file(1) confirms the type, so keyrings and
+    # grep -I skips binaries and is_text_file confirms the type, so keyrings and
     # images are never rewritten.
     local n=0 f
     while IFS= read -r -d '' f; do
@@ -230,6 +246,13 @@ deps_missing() {
     fi
     return 0
 }
+print_missing_deps() {
+    ( source "$IG/lib/dependencies.sh" && dependencies_check --category all "$IG/depends" ) || true
+}
+
+host_is_arm64() {
+    case $(uname -m) in aarch64|arm64) return 0 ;; *) return 1 ;; esac
+}
 
 install_deps() {
     local -a sudo=()
@@ -238,37 +261,35 @@ install_deps() {
         sudo=(sudo)
     fi
     local -a extra=(file zstd git ca-certificates rsync)
-    case $(uname -m) in
-        aarch64|arm*) ;;
-        *) extra+=(qemu-user-static binfmt-support arch-test) ;;
-    esac
+    host_is_arm64 || extra+=(qemu-user-static binfmt-support arch-test)
     log "Installing host dependencies with apt..."
     "${sudo[@]}" apt-get update
     "${sudo[@]}" apt-get install -y --no-install-recommends "${extra[@]}"
-    "${sudo[@]}" "$IG/install_deps.sh"
+    # install_deps.sh refuses to finish while binfmt_misc is not loaded, so load
+    # it first (a no-op where it is built in, e.g. WSL2).
     if ! grep -q binfmt_misc /proc/filesystems 2>/dev/null; then
-        "${sudo[@]}" modprobe binfmt_misc || true
+        "${sudo[@]}" modprobe binfmt_misc || warn "could not load binfmt_misc"
     fi
-    case $(uname -m) in
-        aarch64|arm*) ;;
-        *) "${sudo[@]}" update-binfmts --enable qemu-aarch64 >/dev/null 2>&1 || true ;;
-    esac
+    "${sudo[@]}" "$IG/install_deps.sh" || die "rpi-image-gen/install_deps.sh failed"
+    host_is_arm64 || "${sudo[@]}" update-binfmts --enable qemu-aarch64 >/dev/null 2>&1 || true
 }
 
-# The arm64 binfmt handler must be registered in the kernel (with the F flag
-# so it works inside the chroot). On a native arm host nothing is needed.
-check_binfmt() {
-    case $(uname -m) in aarch64|arm*) return 0 ;; esac
+# Is the arm64 handler registered (and enabled) in this kernel? Mounting
+# binfmt_misc inside a container only exposes what the host already has.
+binfmt_arm64_present() {
     local h=/proc/sys/fs/binfmt_misc/qemu-aarch64
     if [[ ! -e $h && $(id -u) -eq 0 ]]; then
-        # In a container binfmt_misc is usually not mounted; mounting it only
-        # exposes what the host kernel already has registered.
         mountpoint -q /proc/sys/fs/binfmt_misc 2>/dev/null \
             || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
     fi
-    if [[ -e $h ]] && head -n1 "$h" | grep -q enabled; then
-        return 0
-    fi
+    [[ -e $h ]] && head -n1 "$h" | grep -q enabled
+}
+
+# The arm64 binfmt handler must be registered in the kernel (with the F flag
+# so it works inside the chroot). On a native arm64 host nothing is needed.
+check_binfmt() {
+    host_is_arm64 && return 0
+    binfmt_arm64_present && return 0
     if [[ $IN_CONTAINER -eq 1 ]]; then
         die "no arm64 binfmt handler in the host kernel. Register it once on the host:
          docker run --privileged --rm tonistiigi/binfmt --install arm64
@@ -362,31 +383,35 @@ run_in_docker() {
     local -a envs=(-e DRONEOS_IN_CONTAINER=1 -e DRONEOS_ROOT=/src -e "DRONEOS_VERSION=$VERSION" -e "TERM=${TERM:-xterm}")
     if [[ -n ${SOURCE_DATE_EPOCH:-} ]]; then envs+=(-e "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"); fi
 
+    local -a bargs=(build -t "$IMAGE_TAG")
+    if [[ $REBUILD -eq 1 ]]; then bargs+=(--pull --no-cache); fi
+    if [[ $DEPS -eq 1 ]]; then bargs+=(--pull); fi
+
     if [[ $DRY_RUN -eq 1 ]]; then
-        echo "$eng build -t $IMAGE_TAG $ROOT/docker"
+        echo "$eng ${bargs[*]} $ROOT/docker"
         echo "$eng run --rm ${tty[*]} --privileged --hostname droneos-builder ${envs[*]} ${mounts[*]} $IMAGE_TAG ${inner[*]}"
         return 0
     fi
 
     log "Builder image $IMAGE_TAG"
-    local -a bargs=(build -t "$IMAGE_TAG")
-    if [[ $REBUILD -eq 1 ]]; then bargs+=(--pull --no-cache); fi
     "$eng" "${bargs[@]}" "$ROOT/docker"
+    if [[ $DEPS -eq 1 ]]; then
+        log "Dependencies live in the builder image; it is up to date."
+        return 0
+    fi
 
-    # arm64 binfmt handler in the host kernel (only needed on non-arm hosts).
-    local host_arch
-    host_arch=$("$eng" info --format '{{.Architecture}}' 2>/dev/null || true)
-    [[ -n $host_arch && $host_arch != '<no value>' ]] || host_arch=$(uname -m)
-    case $host_arch in
-        aarch64|arm64) ;;
-        *)
-            if ! "$eng" run --rm --privileged --entrypoint sh "$IMAGE_TAG" -c \
-                    'mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc; test -e /proc/sys/fs/binfmt_misc/qemu-aarch64' >/dev/null 2>&1; then
-                log "Registering the arm64 QEMU binfmt handler in the host kernel (tonistiigi/binfmt)"
-                "$eng" run --rm --privileged tonistiigi/binfmt --install arm64
-            fi
-            ;;
-    esac
+    # arm64 binfmt handler in the host kernel (only needed on non-arm64 hosts).
+    # Check the host first: a rootless engine cannot see or register it, but the
+    # host may already have qemu-user-static + binfmt-support installed.
+    if ! host_is_arm64 && ! binfmt_arm64_present; then
+        if ! "$eng" run --rm --privileged --entrypoint sh "$IMAGE_TAG" -c \
+                'mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc; test -e /proc/sys/fs/binfmt_misc/qemu-aarch64' >/dev/null 2>&1; then
+            log "Registering the arm64 QEMU binfmt handler in the host kernel (tonistiigi/binfmt)"
+            "$eng" run --rm --privileged tonistiigi/binfmt --install arm64 \
+                || die "could not register the arm64 binfmt handler (rootless engine?). On the host run:
+         sudo apt install qemu-user-static binfmt-support && sudo update-binfmts --enable qemu-aarch64"
+        fi
+    fi
 
     if [[ $SHELL_MODE -eq 1 ]]; then
         [[ -t 0 && -t 1 ]] || die "--shell needs a terminal"
@@ -397,7 +422,7 @@ run_in_docker() {
     log "Building in $eng ($IMAGE_TAG, work volume $WORK_VOLUME)"
     "$eng" run --rm "${tty[@]}" --privileged --hostname droneos-builder "${envs[@]}" "${mounts[@]}" \
         "$IMAGE_TAG" "${inner[@]}"
-    log "Image(s) copied to $out_abs"
+    if [[ $CLEAN -eq 0 && $FS_ONLY -eq 0 ]]; then log "Image(s) copied to $out_abs"; fi
 }
 
 # ---- Native mode ------------------------------------------------------------
@@ -407,7 +432,7 @@ run_native() {
     ensure_submodule
 
     local staged=0
-    if [[ $IN_CONTAINER -eq 1 ]] || ! fs_is_linux_native "$ROOT"; then staged=1; fi
+    if [[ $IN_CONTAINER -eq 1 ]] || fs_is_foreign "$ROOT"; then staged=1; fi
     if [[ -z $WORKROOT ]]; then
         if [[ $staged -eq 1 ]]; then
             WORKROOT="${XDG_CACHE_HOME:-$HOME/.cache}/droneos/work"
@@ -420,8 +445,8 @@ run_native() {
     if [[ $PURGE -eq 1 ]]; then purge_native; return 0; fi
 
     mkdir -p "$WORKROOT"
-    fs_is_linux_native "$WORKROOT" \
-        || die "work dir $WORKROOT is on '$(fs_type "$WORKROOT")'; rpi-image-gen needs a Linux filesystem here (pass -B <dir on ext4/btrfs/xfs>)"
+    fs_is_foreign "$WORKROOT" \
+        && die "work dir $WORKROOT is on '$(fs_type "$WORKROOT")'; rpi-image-gen needs a Linux filesystem here (pass -B <dir on ext4/btrfs/xfs>)"
 
     local SRC
     if [[ $staged -eq 1 ]]; then
@@ -437,13 +462,16 @@ run_native() {
     local CFG
     if [[ $CONFIG == "$ROOT"/* ]]; then CFG="$SRC/${CONFIG#"$ROOT"/}"; else CFG=$CONFIG; fi
 
+    # The same overrides go to build and clean, so both see the same
+    # chroot-<version> / deploy-<version> directories.
+    local -a ov=("IGconf_artefact_version=$VERSION")
+    if [[ $APT_CACHE -eq 1 ]]; then ov+=("IGconf_sys_apt_cachedir=$WORKROOT/apt-cache"); fi
+    ov+=("${OVERRIDES[@]}")
+
     local -a cmd=("$IG/rpi-image-gen" build -S "$SRC" -c "$CFG" -B "$WORKROOT")
     if [[ $FS_ONLY -eq 1 ]];     then cmd+=(-f); fi
     if [[ $IMAGE_ONLY -eq 1 ]];  then cmd+=(-i); fi
     if [[ $INTERACTIVE -eq 1 ]]; then cmd+=(-I); fi
-    local -a ov=("IGconf_artefact_version=$VERSION")
-    if [[ $APT_CACHE -eq 1 ]]; then ov+=("IGconf_sys_apt_cachedir=$WORKROOT/apt-cache"); fi
-    ov+=("${OVERRIDES[@]}")
     cmd+=(-- "${ov[@]}")
 
     log "DroneOS image build"
@@ -461,20 +489,19 @@ run_native() {
 
     if [[ $DEPS -eq 1 ]]; then
         install_deps
-        deps_missing && die "Dependencies are still missing after the install (see above)"
+        deps_missing && { print_missing_deps; die "Dependencies are still missing after the install (see above)"; }
         check_binfmt
         log "Host dependencies OK"
         return 0
     fi
     if deps_missing; then
+        print_missing_deps
         if [[ $IN_CONTAINER -eq 1 ]]; then
-            ( source "$IG/lib/dependencies.sh" && dependencies_check --category all "$IG/depends" ) || true
             die "The builder image lacks dependencies - rebuild it: ./build.sh --docker --rebuild (build.ps1 -Rebuild)"
         fi
         warn "Host dependencies are missing - installing them now (sudo may ask for your password)."
-        ( source "$IG/lib/dependencies.sh" && dependencies_check --category all "$IG/depends" ) || true
         install_deps
-        deps_missing && die "Dependencies are still missing after the install (see above)"
+        deps_missing && { print_missing_deps; die "Dependencies are still missing after the install (see above)"; }
     fi
     check_binfmt
     fix_parent_perms "$WORKROOT"
@@ -486,7 +513,18 @@ run_native() {
 
     if [[ $CLEAN -eq 1 ]]; then
         log "rpi-image-gen clean ($CFG)"
-        yes | "$IG/rpi-image-gen" clean -c "$CFG" -B "$WORKROOT"
+        # Answers every "Remove ...?" prompt with yes. Process substitution
+        # rather than a pipe: yes(1) dying of SIGPIPE afterwards must not turn
+        # into exit 141 under pipefail.
+        "$IG/rpi-image-gen" clean -c "$CFG" -B "$WORKROOT" -- "${ov[@]}" < <(yes)
+        # Upstream clean looks for IGconf_image_deploydir, which no layer sets;
+        # the real variable is IGconf_deploy_dir, so the deploy set would pile
+        # up in the work tree.
+        local final="$WORKROOT/bootstrap/final.env" deploy
+        if deploy=$(getvar IGconf_deploy_dir "$final") && [[ $deploy == "$WORKROOT"/* && -d $deploy ]]; then
+            log "Removing $deploy"
+            rm -rf -- "$deploy"
+        fi
         return 0
     fi
 
